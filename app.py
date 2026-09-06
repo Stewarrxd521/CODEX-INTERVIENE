@@ -1344,7 +1344,10 @@ class TradingBot:
             )
             breakdown = close < prior_low and close < float(opens.iloc[-1])
             volume_ok = volume_ratio >= MIN_VOLUME_RATIO
-            ok = bearish_alignment and breakdown and volume_ok
+            # pandas devuelve numpy.bool_ para las comparaciones. Flask/Python
+            # 3.14 no lo serializa como JSON nativo, por eso se convierte de
+            # forma explícita antes de guardar el diagnóstico en /api/status.
+            ok = bool(bearish_alignment and breakdown and volume_ok)
             reason = "EMA bajistas + ruptura + volumen confirmado" if ok else (
                 "EMAs no bajistas" if not bearish_alignment else
                 "sin ruptura bajista" if not breakdown else

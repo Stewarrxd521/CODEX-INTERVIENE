@@ -1,17 +1,21 @@
-# Bot Trading Riesgo - Shorts a ganadores de Binance Futures
+# Bot Trading Riesgo - Reversión short con EMA y volumen en Binance Futures
 
-Aplicación web lista para Render que monitorea los ganadores de Binance USDT-M Futures y abre tramos **short** cuando un símbolo supera niveles de ganancia de 24h.
+Aplicación web lista para Render que monitorea contratos USDT-M de Binance y busca **reversiones bajistas confirmadas** antes de abrir tramos *short*. No existe una estrategia con rentabilidad garantizada: este bot es una implementación configurable para investigación y *paper trading*, no una promesa de resultados.
 
 ## Estrategia implementada
 
-- Actualiza los ganadores de Binance Futures por `priceChangePercent` de 24h con **una** consulta REST controlada por minuto.
+- Actualiza los ganadores de Binance Futures por `priceChangePercent` de 24h con WebSocket y ciclos de filtrado controlados.
 - Usa WebSocket de Binance (`!ticker@arr`) para mantener precios, cambios 24h y volumen en tiempo real entre escaneos, evitando polling agresivo.
-- Abre short en tramos configurables cuando el cambio 24h supera estos niveles:
+- Descarga y mantiene velas de 1 minuto para calcular la señal. Un short solo se permite cuando una **vela cerrada** cumple simultáneamente:
+  - EMA rápida (9 por defecto) por debajo de EMA lenta (21).
+  - EMA lenta por debajo de la EMA de tendencia (55).
+  - Vela roja cuyo cierre rompe el mínimo de las 5 velas anteriores.
+  - Volumen de la vela de ruptura de al menos 1.5× la media de las 20 velas anteriores.
+- Si esa confirmación existe, abre tramos configurables cuando el cambio 24h supera estos niveles:
   - `50%, 75%, 100%, 150%, 200%, 250%`
 - Tamaño de cada tramo:
   - `5, 5, 10, 20, 40, 80 USDT`
-- Cierra toda la posición cuando la ganancia no realizada llega al 50% del capital colocado:
-  - Ejemplo: posición de `5 USDT` -> cierre con `2.5 USDT` de ganancia.
+- Cierra toda la posición cuando la ganancia no realizada llega al 12.5% del capital colocado por defecto.
 - Muestra en una página web:
   - Ganadores detectados.
   - Posiciones abiertas.
@@ -32,7 +36,7 @@ BINANCE_API_KEY=tu_api_key
 BINANCE_API_SECRET=tu_api_secret
 ```
 
-> Usa primero paper trading. Un short contra monedas que suben 100%-250% puede liquidarse si no hay control de margen, apalancamiento y pérdidas.
+> Usa primero paper trading y valida la estrategia con datos fuera de muestra, comisiones, *slippage* y distintos regímenes de mercado. Un short contra monedas que suben 100%-250% puede liquidarse si no hay control de margen, apalancamiento y pérdidas.
 
 ## Variables de entorno principales
 
@@ -42,9 +46,15 @@ BINANCE_API_SECRET=tu_api_secret
 | `LIVE_TRADING` | `false` | Habilita órdenes reales si también `PAPER_MODE=false`. |
 | `ENTRY_LEVELS` | `50,75,100,150,200,250` | Niveles de subida 24h para abrir tramos. |
 | `ENTRY_NOTIONALS` | `5,5,10,20,40,80` | USDT por tramo. |
-| `TAKE_PROFIT_FRACTION` | `0.5` | Ganancia objetivo sobre el notional total. |
-| `SCAN_INTERVAL_SECONDS` | `60` | Frecuencia mínima de consulta REST para refrescar ganadores y actualizar la lista seguida por WebSocket. |
-| `MAX_SYMBOLS` | `120` | Máximo de ganadores a evaluar por escaneo. |
+| `TAKE_PROFIT_FRACTION` | `0.125` | Ganancia objetivo sobre el notional total. |
+| `EMA_FAST_PERIOD` | `9` | Período de la EMA rápida de confirmación bajista. |
+| `EMA_SLOW_PERIOD` | `21` | Período de la EMA lenta de confirmación bajista. |
+| `EMA_TREND_PERIOD` | `55` | Período de la EMA que filtra la tendencia. |
+| `VOLUME_LOOKBACK` | `20` | Velas usadas para la media de volumen. |
+| `MIN_VOLUME_RATIO` | `1.5` | Múltiplo mínimo de volumen para aceptar la ruptura. |
+| `BREAKDOWN_LOOKBACK` | `5` | Velas previas cuyo mínimo debe romper el cierre. |
+| `KLINE_HISTORY_CANDLES` | `120` | Historial de velas de 1 minuto que mantiene el caché. Debe ser mayor que la EMA más larga. |
+| `SCAN_INTERVAL_SECS` | `2` | Frecuencia de evaluación de las señales ya presentes en WebSocket. |
 | `MIN_GAIN_TO_SHOW` | `0` | Filtro mínimo de porcentaje para mostrar ganadores en la tabla. |
 | `INCLUDE_SPOT_WINNERS` | `false` | Conservado solo para el fallback manual REST; el escaneo operativo usa futures por WebSocket. |
 | `LEVERAGE` | `1` | Apalancamiento que intentará configurar en modo real. |
@@ -66,4 +76,3 @@ Si el bot abre posiciones en los logs pero la página no las muestra, revisa en 
 ## Deploy en Render
 
 El archivo `render.yaml` incluye el servicio web y fija `PYTHON_VERSION=3.12.13` para evitar que Render use Python 3.14, donde dependencias con extensiones nativas pueden compilar desde fuente y fallar. En Render configura las variables de entorno necesarias y despliega el repositorio.
-

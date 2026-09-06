@@ -225,6 +225,18 @@ ENTRY_LEVELS    = [float(x) for x in os.getenv("ENTRY_LEVELS",    "50,75,100,150
 ENTRY_NOTIONALS = [float(x) for x in os.getenv("ENTRY_NOTIONALS", "5,5,10,20,40,80").split(",")]
 TAKE_PROFIT_FRACTION = float(os.getenv("TAKE_PROFIT_FRACTION", "0.125")) #"0.1428"
 
+# ── Entrada: reversión bajista confirmada por EMA y volumen ────────────────
+# No existe una estrategia "ganadora" garantizada. Este filtro evita abrir un
+# short simplemente porque un activo subió: exige evidencia de que el impulso
+# ya se ha deteriorado en velas cerradas y que el movimiento tiene liquidez.
+EMA_FAST_PERIOD       = int(os.getenv("EMA_FAST_PERIOD", "9"))
+EMA_SLOW_PERIOD       = int(os.getenv("EMA_SLOW_PERIOD", "21"))
+EMA_TREND_PERIOD      = int(os.getenv("EMA_TREND_PERIOD", "55"))
+VOLUME_LOOKBACK       = int(os.getenv("VOLUME_LOOKBACK", "20"))
+MIN_VOLUME_RATIO      = float(os.getenv("MIN_VOLUME_RATIO", "1.5"))
+BREAKDOWN_LOOKBACK    = int(os.getenv("BREAKDOWN_LOOKBACK", "5"))
+KLINE_HISTORY_CANDLES = int(os.getenv("KLINE_HISTORY_CANDLES", "120"))
+
 # Stop loss en USD (pérdida absoluta, valor negativo).
 #
 # Regla fijada por el usuario:
@@ -660,6 +672,10 @@ class TradingBot:
         self.winners:   List[dict] = []
         self.closed_trades: List[dict] = []
         self.events:        List[str]  = []
+        # Diagnóstico de la última evaluación EMA/volumen por símbolo. Se
+        # conserva separado de winners porque el ticker WS reemplaza precios
+        # continuamente, mientras que la señal solo usa velas ya cerradas.
+        self.strategy_signals: Dict[str, dict] = {}
         self.lock = threading.Lock()
         self._trade_id_lock = threading.Lock()
 
@@ -872,9 +888,9 @@ class TradingBot:
         pairs = {sym: ["1m"] for sym in symbols}
         self.kline_cache = KlineWebSocketCache(
             pairs                           = pairs,
-            max_candles                     = 1,
+            max_candles                     = KLINE_HISTORY_CANDLES,
             include_open_candle             = True,
-            backfill_on_start               = False,
+            backfill_on_start               = True,
             streams_per_connection          = 30,
             rest_concurrency                = 5,
             rest_retries                    = 3,
@@ -883,7 +899,10 @@ class TradingBot:
             safety_refresh_interval_seconds = 1500,
         )
         self.kline_cache.start()
-        self.log(f"KlineCache iniciado con {len(symbols)} símbolos (1m)")
+        self.log(
+            f"KlineCache iniciado con {len(symbols)} símbolos (1m, "
+            f"historial={KLINE_HISTORY_CANDLES})"
+        )
 
     # ── Caché de símbolos en disco ─────────────────────────────────────────────
 
@@ -1288,20 +1307,59 @@ class TradingBot:
                 if not self.running:
                     break
 
-    # ── Condición kline ───────────────────────────────────────────────────────
+    # ── Señal de entrada: reversión EMA + volumen ─────────────────────────────
 
-    def _kline_entry_ok(self, symbol: str) -> bool:
-        """True si la última vela 1m cerrada es alcista (o sin datos)."""
+    def _short_entry_signal(self, symbol: str) -> dict:
+        """Evalúa una reversión bajista exclusivamente con velas cerradas.
+
+        La señal requiere: (1) EMA rápida por debajo de la lenta, (2) ambas
+        bajo la EMA de tendencia, (3) cierre rojo que rompe los mínimos de las
+        velas previas y (4) volumen de la vela al menos ``MIN_VOLUME_RATIO``
+        veces su media. Si faltan datos, se bloquea la entrada de forma segura;
+        nunca se asume que una señal es válida por falta de historial.
+        """
+        required = max(EMA_TREND_PERIOD + 2, VOLUME_LOOKBACK + 2,
+                       BREAKDOWN_LOOKBACK + 2)
+        result = {"ok": False, "reason": "sin datos de velas"}
         if not self.kline_cache:
-            return True
+            return result
         try:
             df = self.kline_cache.get_dataframe(symbol, "1m", only_closed=True)
-            if df.empty or len(df) < 2:
-                return True
-            last = df.iloc[-1]
-            return float(last["close"]) >= float(last["open"])
-        except Exception:
-            return True
+            if len(df) < required:
+                return {"ok": False, "reason": f"historial insuficiente ({len(df)}/{required})"}
+
+            closes = df["close"].astype(float)
+            opens = df["open"].astype(float)
+            volumes = df["volume"].astype(float)
+            ema_fast = closes.ewm(span=EMA_FAST_PERIOD, adjust=False).mean()
+            ema_slow = closes.ewm(span=EMA_SLOW_PERIOD, adjust=False).mean()
+            ema_trend = closes.ewm(span=EMA_TREND_PERIOD, adjust=False).mean()
+            volume_mean = volumes.iloc[-VOLUME_LOOKBACK - 1:-1].mean()
+            volume_ratio = (volumes.iloc[-1] / volume_mean) if volume_mean > 0 else 0.0
+            prior_low = float(df["low"].astype(float).iloc[-BREAKDOWN_LOOKBACK - 1:-1].min())
+            close = float(closes.iloc[-1])
+            bearish_alignment = (
+                float(ema_fast.iloc[-1]) < float(ema_slow.iloc[-1])
+                and float(ema_slow.iloc[-1]) < float(ema_trend.iloc[-1])
+            )
+            breakdown = close < prior_low and close < float(opens.iloc[-1])
+            volume_ok = volume_ratio >= MIN_VOLUME_RATIO
+            ok = bearish_alignment and breakdown and volume_ok
+            reason = "EMA bajistas + ruptura + volumen confirmado" if ok else (
+                "EMAs no bajistas" if not bearish_alignment else
+                "sin ruptura bajista" if not breakdown else
+                f"volumen bajo ({volume_ratio:.2f}x < {MIN_VOLUME_RATIO:.2f}x)"
+            )
+            return {
+                "ok": ok, "reason": reason,
+                "ema_fast": round(float(ema_fast.iloc[-1]), 8),
+                "ema_slow": round(float(ema_slow.iloc[-1]), 8),
+                "ema_trend": round(float(ema_trend.iloc[-1]), 8),
+                "volume_ratio": round(float(volume_ratio), 3),
+                "close": close,
+            }
+        except Exception as exc:
+            return {"ok": False, "reason": f"error de señal: {exc}"}
 
     # ── Cooldown helpers ──────────────────────────────────────────────────────
 
@@ -1362,10 +1420,15 @@ class TradingBot:
                         if symbol in self.price_blocked:
                             continue
 
-                    kline_ok = self._kline_entry_ok(symbol)
+                    signal = self._short_entry_signal(symbol)
+                    with self.lock:
+                        self.strategy_signals[symbol] = signal
 
                     for idx, (level, notional) in enumerate(zip(ENTRY_LEVELS, ENTRY_NOTIONALS)):
-                        if change >= level and kline_ok:
+                        # Los niveles de variación determinan el tamaño de la
+                        # exposición, pero una entrada solo se permite tras la
+                        # confirmación EMA/volumen sobre una vela ya cerrada.
+                        if change >= level and signal["ok"]:
                             if idx == 2:
                                 # 3er tramo: sujeto a la condición de MFE mínimo
                                 await self._ensure_third_or_hedge(symbol, level, notional, price, change)
@@ -2095,6 +2158,7 @@ class TradingBot:
 
         with self.lock:
             winners_raw        = [dict(w) for w in self.winners]
+            strategy_signals   = dict(self.strategy_signals)
             positions_raw      = dict(self.positions)
             closed             = list(self.closed_trades[:130])
             events             = list(self.events[:50])
@@ -2117,6 +2181,7 @@ class TradingBot:
             winners_out.append({
                 **w,
                 "price":              price,
+                "strategy_signal":    strategy_signals.get(sym, {"ok": False, "reason": "pendiente"}),
                 "cooldown_remaining": remaining,
                 "cooldown_str":       self._fmt_cooldown(remaining) if remaining > 0 else "",
                 "price_blocked":      sym in price_blocked_snap,
@@ -2215,6 +2280,16 @@ class TradingBot:
             "entry_levels":      ENTRY_LEVELS,
             "entry_notionals":   ENTRY_NOTIONALS,
             "take_profit_pct":   TAKE_PROFIT_FRACTION * 100,
+            "strategy": {
+                "name": "Reversión short EMA + volumen",
+                "ema_fast_period": EMA_FAST_PERIOD,
+                "ema_slow_period": EMA_SLOW_PERIOD,
+                "ema_trend_period": EMA_TREND_PERIOD,
+                "volume_lookback": VOLUME_LOOKBACK,
+                "min_volume_ratio": MIN_VOLUME_RATIO,
+                "breakdown_lookback": BREAKDOWN_LOOKBACK,
+                "history_candles": KLINE_HISTORY_CANDLES,
+            },
             "default_stop_loss_usd": DEFAULT_STOP_LOSS_USD,
             "adaptive_sl":       self.adaptive_sl.stats_summary(),
             "total_unrealized":   total_unreal,
@@ -2637,7 +2712,7 @@ HTML = r"""<!doctype html>
         <th>Símbolo</th>
         <th>Cambio 24h (WS)</th>
         <th>Precio (markPrice)</th>
-        <th>Cond. kline</th>
+        <th>Señal EMA / volumen</th>
         <th>Short</th>
         <th>Estado</th>
       </tr></thead>
@@ -2922,7 +2997,9 @@ function render(d) {
     const change     = n(w.change);
     const cdSecs     = n(w.cooldown_remaining);
     const inCooldown = cdSecs > 0;
-    const canTrade   = change >= entryLevels[0] && !inCooldown;
+    const signal     = w.strategy_signal || {};
+    const signalOk   = Boolean(signal.ok);
+    const canTrade   = change >= entryLevels[0] && signalOk && !inCooldown;
     const rowCls     = inCooldown ? 'in-cooldown' : (canTrade ? 'can-trade' : '');
 
     if (inCooldown && !_cdData[w.symbol]) {
@@ -2945,9 +3022,9 @@ function render(d) {
              target="_blank">${w.symbol}</a></td>
       <td class="${cls(change)}" style="font-weight:600">${pct(change)}</td>
       <td>${fx(n(w.price))}</td>
-      <td>${canTrade
-            ? '<span style="color:var(--green)">✓ alcista</span>'
-            : '<span style="color:var(--muted)">—</span>'}</td>
+      <td title="${String(signal.reason || 'pendiente').replace(/&/g, '&amp;').replace(/"/g, '&quot;')}">${signalOk
+            ? `<span style="color:var(--green)">✓ ${fx(n(signal.volume_ratio), 2)}x</span>`
+            : `<span style="color:var(--muted)">${signal.reason || 'pendiente'}</span>`}</td>
       <td>${w.can_short
             ? '<span style="color:var(--green)">sí</span>'
             : '<span style="color:var(--red)">no</span>'}</td>
